@@ -50,24 +50,24 @@ def feature_set(types, token_features, map):
             # [10] int_dom_token_no, [11] dom_token_id, [12] rel
             if features[5] != 'VB':
                 feature_dict = {
-                    # "surface" : features[3],
-                    # "lemma" : features[4],
+                    "surface" : features[3],
+                    "lemma" : features[4],
                     "pos" : features[5],
-                    # "sense_no" : features[6],
+                    "sense_no" : features[6],
                     "sense_key" : features[7],
-                    # "ssid" : features[8],
+                    "ssid" : features[8],
                     "rel" : features[11],
                 }
-                # if features[9] != '0':
-                #     feature_dict.update({
-                #         "int_dom_token": map[features[9]],
-                #         "dom_token": map[features[10]]
-                #     })
-                # else:
-                #     feature_dict.update({
-                #         "int_dom_token": None,
-                #         "dom_token": None
-                #     })
+                if features[9] != '0':
+                    feature_dict.update({
+                        "int_dom_token": map[features[9]],
+                        "dom_token": map[features[10]]
+                    })
+                else:
+                    feature_dict.update({
+                        "int_dom_token": None,
+                        "dom_token": None
+                    })
                 # print((feature_dict, i[1]))
                 feature_set.append((feature_dict, i[1]))
 
@@ -93,7 +93,9 @@ def evaluate_classifier(classifier, test_set):
     :return: percentage accuracy of the classifier being able to label the data correctly based on features.
     """
     accuracy = nltk.classify.accuracy(classifier, test_set)
+    # metrics = nltk.metrics.scores.f_measure(classifier, test_set)
     print(accuracy)
+    # print(metrics)
 
 def type_count(types):
     count = 0
@@ -113,6 +115,7 @@ if __name__ == '__main__':
     classifier = train_classifier(training_set)
     evaluate_classifier(classifier, test_set)
     print(classifier.labels())
+
     # classifier.show_most_informative_features(10)
 
 
