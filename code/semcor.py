@@ -29,6 +29,8 @@ If sources have not yet been compiled you first need to do this:
 Here all files are compiled, you can add an integer-valued argument to restrict
 the number of files to compile.
 
+NOTE: this file was copied from the semcor repository
+
 """
 
 from __future__ import print_function
@@ -159,7 +161,7 @@ class Semcor(object):
         t0 = time.time()
         self.files = []
         self.loaded = self.fcount if maxfiles > self.fcount else maxfiles
-        print('Loading compiled files...')
+        print('Loading compiled Semcor files...')
         for fname in self.fnames[:maxfiles]:
             pickle_file = pickle_file_name(fname)
             with open(pickle_file, 'rb') as fh:

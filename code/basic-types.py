@@ -1,11 +1,58 @@
-# from bs4 import BeautifulSoup
-from semcor import Semcor, SemcorFile
+"""basic-types.py
+
+Module for creating and running the basic types classifier.
+
+Usage
+
+$ python3 basic-types.py --train-semcor
+
+    Train a classifier from all of Semcor and save it in
+    ../data/classifier-all.pickle.
+
+$ python3 basic-types.py --train-test
+
+    Train a classifier from a fragemtn of Semcor (two files) and save it in
+    ../data/classifier-002.pickle, for testing and debugging purposes.
+
+$ python3 basic-types.py --test
+
+    Test the classifier on a feature set and test the evaluation code.
+
+$ python3 basic-types.py --classify-file FILENAME
+
+    Run the classifier on filename, output will be written to the terminal.
+
+$ python3 basic-types.py --classify-spv1
+
+    Run the classifier on all SPV1 files, output will be written to the out/
+    directory.
+
+The last two invocations both require the NLTK CoreNLPDependencyParser which
+assumes that the Stanford CoreNLP server is running at port 9000. To use the
+server run the following from the corenlp directory:
+
+$ java -mx4g -cp "*" edu.stanford.nlp.pipeline.StanfordCoreNLPServer -preload tokenize,ssplit,pos,lemma,depparse -status_port 9000 -port 9000 -timeout 15000
+
+Note that this invocation does not allow you browser access to port 9000 because
+the homepage uses an annotator that is not loaded by the above command.
+
+"""
+
+
+import os, sys, csv, getopt, pickle, codecs, json, glob
+
 import nltk
-import csv
+from nltk.parse.corenlp import CoreNLPDependencyParser
+from nltk.stem import WordNetLemmatizer
+
+from semcor import Semcor, SemcorFile
+
 
 SC_SENT = '../data/semcor.sent.tsv'
 SC_TOKEN_FT = '../data/semcor.token.tsv'
+SC_TOKEN_FT_SMALL = '../data/semcor.token.tsv.10000'
 SC_TOKEN_DEP = '../data/semcor.token.fv'
+
 
 def data_prep(file):
     with open(file) as tsvfile:
@@ -13,9 +60,14 @@ def data_prep(file):
         data = [row for row in reader]
         return data
 
+
 def extract_types(sc):
+    """
+    Returns a list of types from each wordform in semcor as well as a mapping
+    from integers to tokens.
+    """
     types = []
-    map = {}
+    mapping = {}
     i = 0
     sen_list = [file.get_sentences() for file in sc.files]
     for list in sen_list:
@@ -25,22 +77,20 @@ def extract_types(sc):
                 i += 1
                 if form.is_word_form():
                     if form.lemma is not None:
-                        map.update({str(i): form.lemma})
+                        mapping.update({str(i): form.lemma})
                     else:
-                        map.update({str(i): form.text})
+                        mapping.update({str(i): form.text})
                     if form.synset is not None:
                             types.append(form.synset.btypes)
                     else:
                         types.append(None)
                 else:
-                    map.update({str(i): form.text})
+                    mapping.update({str(i): form.text})
                     types.append(None)
-
-    # print(map)
-    return types, map
+    return types, mapping
 
 
-def feature_set(types, token_features, map):
+def feature_set(types, token_features, mapping):
     mapped = zip(token_features, types)
     feature_set = []
     for i in mapped:
@@ -60,8 +110,8 @@ def feature_set(types, token_features, map):
                 }
                 if features[9] != '0':
                     feature_dict.update({
-                        "int_dom_token": map[features[9]],
-                        "dom_token": map[features[10]]
+                        "int_dom_token": mapping[features[9]],
+                        "dom_token": mapping[features[10]]
                     })
                 else:
                     feature_dict.update({
@@ -74,17 +124,46 @@ def feature_set(types, token_features, map):
     return feature_set
 
 
-def create_train_test_data(feature_set):
+def split_data(feature_set):
     index = int(len(feature_set) * .8)
     training_set, test_set = feature_set[:index], feature_set[index:]
-
     return training_set, test_set
 
+
 def train_classifier(training_set):
-
     classifier = nltk.NaiveBayesClassifier.train(training_set)
-
     return classifier
+
+
+def save_classifier(classifier, name):
+    filename = '../data/classifier-%s.pickle' % name
+    print("Saving %s" % filename)
+    with open(filename, 'wb') as fh:
+        pickle.dump(classifier, fh)
+
+
+def load_classifier(name):
+    filename = '../data/classifier-%s.pickle' % name
+    print("Loading %s" % filename)
+    with open(filename, 'rb') as fh:
+        classifier = pickle.load(fh)
+    return classifier
+
+
+def save_test_features(features, name):
+    filename = '../data/test-features-%s.pickle' % name
+    print("Saving %s" % filename)
+    with open(filename, 'wb') as fh:
+        pickle.dump(features, fh)
+
+
+def load_test_features(name):
+    filename = '../data/test-features-%s.pickle' % name
+    print("Loading %s" % filename)
+    with open(filename, 'rb') as fh:
+        features = pickle.load(fh)
+    return features
+
 
 def evaluate_classifier(classifier, test_set):
     """
@@ -93,30 +172,143 @@ def evaluate_classifier(classifier, test_set):
     :return: percentage accuracy of the classifier being able to label the data correctly based on features.
     """
     accuracy = nltk.classify.accuracy(classifier, test_set)
-    # metrics = nltk.metrics.scores.f_measure(classifier, test_set)
-    print(accuracy)
-    # print(metrics)
+    return accuracy
 
-def type_count(types):
-    count = 0
-    for type in types:
-        if type is not None:
-            count += 1
-    return count, len(types)
+
+def print_type_count(types):
+    count = len([t for t in types if t is not None])
+    print("Total number of types: %d" % len(types))
+    print("Number of non-nil types: %d" % count)
+
+
+def train_test():
+    """Train a model on the first 2 files of Semcor, using the partial feature file
+    SC_TOKEN_FT_SMALL, this evaluates at 0.8808. Model and test features are
+    written to ../data."""
+    semcor = Semcor(2)
+    _train(semcor, SC_TOKEN_FT_SMALL, '002')
+
+def train():
+    """Train a model on all of Semcor, using the full feature file SC_TOKEN_FT, this
+    evaluates at 0.9334. Model and test features are written to ../data."""
+    semcor = Semcor()
+    _train(semcor, SC_TOKEN_FT, 'all')
+
+
+def _train(semcor, features_in, model_name):
+    token_features = data_prep(features_in)
+    types_from_semcor, identifier2token = extract_types(semcor)
+    print_type_count(types_from_semcor)
+    feature_data = feature_set(types_from_semcor, token_features, identifier2token)
+    training_set, test_set = split_data(feature_data)
+    # maybe add an option to train on the entire set
+    classifier = train_classifier(training_set)
+    print("Labels: %s" % classifier.labels())
+    accuracy = evaluate_classifier(classifier, test_set)
+    print("Accuracy on test set is %.4f" % accuracy)
+    save_classifier(classifier, model_name)
+    save_test_features(test_set, model_name)
+    #classifier.show_most_informative_features(20)
+    
+
+def test_classifier(classifier_name, test_set):
+    # just run one set of features through it
+    print("Running classifier on one set of features")
+    classifier = load_classifier(classifier_name)
+    features = {'pos': 'NN', 'rel': 'nsubj',
+                'sense_key': '1:09:00::', 'ssid': '05808619', 'sense_no': '1',
+                'dom_token': 'produce', 'int_dom_token': 'produce',
+                'lemma': 'investigation', 'surface': 'investigation'}
+    print(classifier.classify(features))
+    print("Evaluating classifier")
+    test_set = load_test_features(test_set)
+    print(classifier.labels())
+    accuracy = evaluate_classifier(classifier, test_set)
+    print("Accuracy on test set is %.4f" % accuracy)
+    classifier.show_most_informative_features(20)
+
+
+def run_classifier_on_file(fname_in, fname_out=None):
+    classifier = load_classifier('all')
+    lemmatizer = WordNetLemmatizer()
+    text = codecs.open(fname_in).read()
+    if fname_out is None:
+        fh_out = sys.stdout
+    else:
+        fh_out = codecs.open(fname_out, 'w')
+    sentences = nltk.sent_tokenize(text)
+    parser = CoreNLPDependencyParser(url='http://localhost:9000')
+    for sentence in sentences:
+        parses = parser.parse(nltk.word_tokenize(sentence))
+        for parse in parses:
+            for (gov, gov_pos), rel, (dep, dep_pos) in parse.triples():
+                if dep_pos in ('NN', 'NNS'):
+                    lemma = lemmatizer.lemmatize(dep)
+                    features = {'pos': dep_pos, 'rel': rel,
+                                'lemma': lemma, 'surface': dep,
+                                'dom_token': gov, 'int_dom_token': gov}
+                    label = classifier.classify(features)
+                    fh_out.write("%s\t%s\n" % (lemma, label))
+                    print(lemma, label)
+        print('')
+
+
+def run_classifier_on_string(classifier, lemmatizer, text, fname_out):
+
+    fh_out = codecs.open(fname_out, 'w')
+    sentences = nltk.sent_tokenize(text)
+    parser = CoreNLPDependencyParser(url='http://localhost:9000')
+    for sentence in sentences:
+        parses = parser.parse(nltk.word_tokenize(sentence))
+        for parse in parses:
+            for (gov, gov_pos), rel, (dep, dep_pos) in parse.triples():
+                if dep_pos in ('NN', 'NNS'):
+                    lemma = lemmatizer.lemmatize(dep)
+                    features = {'pos': dep_pos, 'rel': rel,
+                                'lemma': lemma, 'surface': dep,
+                                'dom_token': gov, 'int_dom_token': gov}
+                    label = classifier.classify(features)
+                    fh_out.write("%s\t%s\n" % (lemma, label))
+
+
+def run_classifier_on_spv1():
+    classifier = load_classifier('all')
+    lemmatizer = WordNetLemmatizer()
+    fnames = glob.glob('/DATA/dtra/spv1-results-lif-ela/documents/*.json')
+    for fname in fnames[:2]:
+        try:
+            with codecs.open(fname) as fh:
+                json_object = json.load(fh)
+                text = json_object['text']
+                print(fname, len(text))
+                outfile = os.path.join('out', os.path.basename(fname))
+                run_classifier_on_string(classifier, lemmatizer, text, outfile)
+        except:
+            print('ERROR')
+
 
 if __name__ == '__main__':
 
-    sc = Semcor()
-    token_features = data_prep(SC_TOKEN_FT)
-    types, map = extract_types(sc)
-    print(type_count(types))
-    feature_data = feature_set(types, token_features, map)
-    training_set, test_set = create_train_test_data(feature_data)
-    classifier = train_classifier(training_set)
-    evaluate_classifier(classifier, test_set)
-    print(classifier.labels())
+    options = ['train-test', 'train-semcor', 'test', 'classify-file=', 'classify-spv1']
+    opts, args = getopt.getopt(sys.argv[1:], '', options)
 
-    # classifier.show_most_informative_features(10)
+    for opt, val in opts:
 
+        if opt == '--train-test':
+            train_test()
 
+        elif opt == '--train-semcor':
+            train()
 
+        elif opt == '--test':
+            # test the classifeir with the full model on the 002 test set, gives
+            # unrealistic results because the training data probably includes
+            # the test data, just here to see whether the mechanism works
+            test_classifier('all', '002')
+
+        elif opt == '--classify-file':
+            filename = val
+            run_classifier_on_file(filename)
+
+        elif opt == '--classify-spv1':
+            run_classifier_on_spv1()
