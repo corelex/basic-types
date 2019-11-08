@@ -1,9 +1,52 @@
-# Semcor Browser and Interface
+# Basic Types Classification 
 
-Python interface to Semcor 3.0, including a simple browser. The code in this repository is licensed under the [Apache 2](https://www.apache.org/licenses/LICENSE-2.0) license. This repository also includes a copy of Semcor 3.0, which has a separate license which is included in `data/semcor3.0/LICENSE`.
+## Approach
+CoreLex and CoreLex 2.0 investigate systematic polysemy in nouns, establishing an ontology and semantic database of 126 semantic types, defining a large number of systematic polysemous classes through an analysis of WordNet sense distributions. 
+
+In order to better understand these sense distributions and the correlations between them, the ability to associate a lexical item with its semantic type automatedly would be of use. By using the SemCor corpus which comprised of texts semantically annotated with their WordNet sense. We are working to build a classifier that can correctly predict a lexical item’s semantic type in novel texts.
+
+The current performance with the default configuration is .81445 accuracy.
+## Running the Code
+
+The module for running the classifier is basic_types.py. The packages required for running the classifier are documented
+in requirements.txt. Information on usage is accessible via the --help command.
+
+```usage: basic_types.py [-h] [--mode {train-test}] [--model {all,test}]
+                      [--architecture {LogisticRegression,NaiveBayes}]
+                      [--window-size WINDOW_SIZE] [--train-split [0.1-0.9]]
+                      [--prediction-type {unfiltered,filtered}]
+
+A classifier to predict a noun's Corelex Basic Type.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --mode {train-test}
+  --model {all,test}    Choose the the model size you'd like to train and test
+                        against (default=all).
+  --architecture {LogisticRegression,NaiveBayes}
+                        Choose the model architecture you'd like to use
+                        (default=LogisticRegression).
+  --window-size WINDOW_SIZE
+                        Choose the size of the window on either side of a
+                        target token from which to generate features
+                        (default=0).
+  --train-split [0.1-0.9]
+                        Choice the percentage of data you'd like in the
+                        training set (default=0.9).
+  --prediction-type {unfiltered,filtered}
+                        Use the possible synsets as a filter for a token to
+                        limit the possible labels only to those that align
+                        with possible basic types (default=unfiltered).
+ ```
+
+This classifier is built on top of the Semcor browser and its associated objects and compiled files. 
+There should be no need to recompile the Semcor browser, but if you run into issue with Semcor indexing, recompiling is 
+the usual solution. Details on the Semcor browser can be found below.  
 
 
-### Prerequisites
+###Semcor Browser
+
+#### Prerequisites
 
 Python 2.7 or Python 3 is required, Python 3 is strongly recommended because it runs the code much faster and we test the code less frequent on Python 2.7. The only non-standard module used is Beautiful Soup, so you need to install bs4:
 
@@ -16,7 +59,7 @@ All data needed, including Semcor sources, are included in this repository
 This code was not tested on Windows. One expected problem is that the browser and analysis scripts use ANSI escape sequences (at least, I found this to be an issue about 5 years ago).
 
 
-### Browser
+#### Browser
 
 To run the browser you first need to compile the semcor files and then you can start the browser:
 
