@@ -32,25 +32,6 @@ $ python3 basic-types.py classify-spv1
     Run the classifier on all SPV1 files, output will be written to the out/
     directory.
 
-$ python3 basic-types.py cluster
-
-    Creates a t-distributed stochastic neighbor embedding model using the created word embeddings (see: train-semcor
-    and train-test modes). Use the -model test option to use the test-sized model. Default full (all) model.
-
-$ python3 basic-types.py word-cluster
-
-    Creates a t-distributed stochastic neighbor embedding model using the created word embeddings (see: train-semcor
-    and train-test modes) for specific words in the corpus. Use the -w WORD option to specify an input word.
-    Use the -model test option to use the test-sized model. Default full (all)
-    model.
-
-$ python3 basic-types.py polysem-cluster
-
-    Creates a t-distributed stochastic neighbor embedding model using the created word embeddings (see: train-semcor
-    and train-test modes) for lemmas associate with multiple basic types in the corpus. Use the -model test option to
-    use the test-sized model. Default full (all) model.
-
-
 The "classify-file" and "classify-spv1" invocations both require the NLTK CoreNLPDependencyParser which
 assumes that the Stanford CoreNLP server is running at port 9000. To use the
 server run the following from the corenlp directory:
@@ -62,16 +43,13 @@ the homepage uses an annotator that is not loaded by the above command.
 
 """
 import argparse, codecs, csv, glob, json, pickle, os, sys
-from collections import Counter
+import itertools
 
 from bert_embedding import BertEmbedding
-import matplotlib.pyplot as plt, matplotlib.cm as cm, matplotlib.patches as mpatches
 import nltk
+from nltk.corpus import wordnet as wn
 from nltk.parse.corenlp import CoreNLPDependencyParser
-from nltk.stem import WordNetLemmatizer
-import numpy as np
 from semcor import Semcor, SemcorFile
-from sklearn.manifold import TSNE
 from tqdm import tqdm
 
 
@@ -125,8 +103,37 @@ def extract_types(sc):
 
     return types, mapping
 
+def get_synset_features(surface: str):
+    synsets = wn.synsets(surface, pos=wn.NOUN)
 
-def feature_set(types, token_features, mapping):
+    synset_names = [synset.name() for synset in synsets]
+    name_indexes = ["ssid" + str(i) for i in range(0, len(synsets))]
+    hypernyms = [synset.name() for synset in list(itertools.chain.from_iterable([synset.hypernyms() for synset in synsets]))]
+    hypernym_indexes = ["hnid" + str(i) for i in range(0, len(hypernyms))]
+
+    path_hypernyms = [list(itertools.chain.from_iterable(synset.hypernym_paths())) for synset in synsets]
+
+    if len(path_hypernyms) > 1:
+        path_hyp = [hypernym.name() for hypernym_list in path_hypernyms for hypernym in hypernym_list]
+        path_hyp_index = ["hpid" + str(i) for i in range(0, len(path_hypernyms))]
+        path_hypernym_feature = zip(path_hyp_index, path_hyp)
+    else:
+        path_hypernym_feature = None
+
+    return zip(name_indexes, synset_names), zip(hypernym_indexes, hypernyms), path_hypernym_feature
+
+def get_embedding_features(sentence_embedding, token_no):
+    # print(sentence_embedding)
+    token_vector = sentence_embedding[token_no][1][0]
+    if type(token_vector) is not str:
+        indexes = ["v" + str(i) for i in range(0, token_vector.size)]
+        vector_feature = [token_vector[i] for i in range(0, token_vector.size)]
+        return zip(indexes, vector_feature)
+    else:
+        return None
+
+
+def feature_set(types, token_features, identifier2token, sentence_embeddings):
     mapped = zip(token_features, types)
     feature_set = []
     for i in mapped:
@@ -134,29 +141,39 @@ def feature_set(types, token_features, mapping):
             features = i[0]
             # indexs: [0] token_id, [1] sent_id, [2] token_no, [3] surface,[4] lemma, [5] pos, [6] sense_no, [7] sense_key, [8] ssid,
             # [9] int_dom_token_no, [10] dom_token_id, [11] rel
-            #sentence_embedding = bert_embeddings[features[1]]
+            # sentence_embedding = bert_embeddings[features[1]]
             #if features[5] != 'VB'and type(sentence_embedding[int(features[2])-1][1]) is not str:
+            #TODO: Window Features, +/- 3
+            #TODO: Semantic context other nouns in the sentence, their types
+            #TODO: Verb in sentences
+            #TODO: Move to list features -> Sci-kit learn bayesian (sequences, BoW)
+            #TODO: Corelex btypes -> read notes, with details
+            #TODO: Run the MaxEnt version
+            print(features[11])
             if features[5] != 'VB':
                 feature_dict = {
                     "surface" : features[3],
                     "lemma" : features[4],
                     "pos" : features[5],
-                    # "embedding_vector" : sentence_embedding[int(features[2])-1][1][0].tostring(),
-                    # "sense_no" : features[6],
-                    # "sense_key" : features[7],
-                    # "ssid" : features[8],
-                    "rel" : features[11],
+                    "rel_to" : features[11],
                 }
                 if features[9] != '0':
                     feature_dict.update({
-                        "int_dom_token": mapping[features[9]],
-                        "dom_token": mapping[features[10]]
+                        "int_dom_token": identifier2token[features[9]],
+                        "dom_token": identifier2token[features[10]],
                     })
-                # else:
-                #     feature_dict.update({
-                #         "int_dom_token": None,
-                #         "dom_token": None
-                #     })
+                # embedding_features = get_embedding_features(sentence_embeddings[features[1]], int(features[2])-1)
+                # if embedding_features:
+                #     feature_dict.update(embedding_features)
+                synset, hypernym, path_hypernym = get_synset_features(features[3])
+                if synset:
+                    feature_dict.update(synset)
+                if hypernym:
+                    feature_dict.update(hypernym)
+                if path_hypernym:
+                    feature_dict.update(path_hypernym)
+
+                # print(feature_dict)
                 feature_set.append((feature_dict, i[1]))
 
     return feature_set
@@ -169,14 +186,16 @@ def split_data(feature_set):
 
 
 def train_classifier(training_set):
-    classifier = nltk.NaiveBayesClassifier.train(training_set)
-    # classifier = nltk.MaxentClassifier.train(training_set)
+    #TODO: Move to SciKit Learn, get rid of NLTK
+    #TODO: Look at most important feattures, potential bias in training time
+    # classifier = nltk.NaiveBayesClassifier.train(training_set)
+    classifier = nltk.MaxentClassifier.train(training_set)
     return classifier
 
 def create_bert_embeddings(sentences, model_name):
     number_of_sents = sent_count(model_name)
     print("Creating embeddings from BERT...")
-    bert_embedding = BertEmbedding()
+    bert_embedding = BertEmbedding(model='bert_24_1024_16')
     for i in tqdm(range(1, number_of_sents)):
         sentences[str(i)] = bert_embedding(sentences[str(i)])
     save_embeddings(sentences, model_name)
@@ -263,12 +282,12 @@ def sent_count(model_name):
 def _train(semcor, features_in, model_name, create_embeddings):
     token_features, sentences = extract_token_tsv_data(features_in)
     if create_embeddings:
-         create_bert_embeddings(sentences, model_name)
-    # else:
-    #     load_embeddings(model_name)
+        sentence_embeddings = create_bert_embeddings(sentences, model_name)
+    else:
+       sentence_embeddings =  load_embeddings(model_name)
     types_from_semcor, identifier2token = extract_types(semcor)
     print_type_count(types_from_semcor)
-    feature_data = feature_set(types_from_semcor, token_features, identifier2token)
+    feature_data = feature_set(types_from_semcor, token_features, identifier2token, sentence_embeddings)
     training_set, test_set = split_data(feature_data)
     classifier = train_classifier(training_set)
     print("Labels: %s" % classifier.labels())
@@ -372,163 +391,15 @@ def tokentypevector(model_name):
 
     return type2vector
 
-def tsne_all_prep(type2vector):
-    labels = []
-    token_vectors = []
-    surface_form = []
-
-    for (b_type, lemma, surface, vector) in type2vector:
-        if type(vector) is not str:
-            token_vectors.append(vector)
-            labels.append(b_type)
-            surface_form.append(surface)
-
-    return labels, token_vectors, surface_form
-
-def lemma_prep(type2vector, lemma):
-    labels = []
-    token_vectors = []
-    surface_form = []
-
-    for (b_type, cur_lemma, surface, vector) in type2vector:
-        if type(vector) is not str and lemma == cur_lemma:
-            token_vectors.append(vector)
-            labels.append(b_type)
-            surface_form.append(surface)
-
-    return labels, token_vectors, surface_form
-
-
-def polysem_prep(type2vector):
-    all_types = {}
-    for (b_type, cur_lemma, surface, vector) in type2vector:
-        if type(vector) is not str:
-            if cur_lemma not in all_types:
-                all_types.update({cur_lemma:
-                                      {'b_type':[b_type],
-                                       'instances': [
-                                           {'surface': surface,
-                                            'bert_vector': vector,
-                                            'b_type': b_type}]
-                                       }
-                                  })
-            else:
-                all_types[cur_lemma]['b_type'].append(b_type)
-                all_types[cur_lemma]['instances'].append({'surface': surface,
-                                                          'bert_vector': vector,
-                                                          'b_type': b_type})
-        polysem_labels = []
-        polysem_token_vectors = []
-        polysem_surface_form = []
-        for (entry, values) in all_types.items():
-            uniq_types = list(set(values['b_type']))
-            if len(uniq_types) > 1:
-                for instance in values['instances']:
-                    polysem_labels.append(instance['b_type'])
-                    polysem_token_vectors.append(instance['bert_vector'])
-                    polysem_surface_form.append(instance['surface'])
-
-    return polysem_labels, polysem_token_vectors, polysem_surface_form
-
-
-def model_cluster(model_name):
-    type2vector = tokentypevector(model_name)
-    labels, vectors, surface_form = tsne_all_prep(type2vector)
-    x, y = create_tsne_model(vectors)
-    cmap, c_handles =  create_color_handles(labels)
-    display_full_plot(x, y, cmap, c_handles, labels)
-
-def polysem_cluster(model_name):
-    type2vector = tokentypevector(model_name)
-    labels, vectors, surface_form = polysem_prep(type2vector)
-    labeled_cluster_output(labels, vectors, surface_form)
-
-
-def word_cluster(model_name, word):
-    type2vector = tokentypevector(model_name)
-    lemmatizer = WordNetLemmatizer()
-    lemma = lemmatizer.lemmatize(word)
-    labels, vectors, surface_form = lemma_prep(type2vector, lemma)
-    print("Input word: ", word)
-    labeled_cluster_output(labels, vectors, surface_form)
-
-
-def labeled_cluster_output(labels, vectors, surface_form):
-    associated_forms = Counter(surface_form)
-    associated_btypes = Counter(labels)
-    print("Associated word forms: ")
-    for (form, count) in associated_forms.items():
-        print("Form: ", form, " Count: ", count)
-    print("Associated basic types: ")
-    for (btype, count) in associated_btypes.items():
-        print("Basic type: ", btype, " Count: ", count)
-    if surface_form:
-        x, y = create_tsne_model(vectors)
-        cmap, c_handles = create_color_handles(labels)
-        display_word_plot(x, y, cmap, c_handles, labels, surface_form)
-    else:
-        print("Error: this token does not occur in the corpus.")
-
-
-def create_tsne_model(token_vectors):
-    tsne_model = TSNE(perplexity=40, n_components=2, init='pca', n_iter=2500, random_state=23)
-    print("Fitting TSNE model...")
-    new_values = tsne_model.fit_transform(token_vectors)
-    x = []
-    y = []
-    for value in new_values:
-        x.append(value[0])
-        y.append(value[1])
-
-    return x,y
-
-def display_full_plot(x, y, cmap, mpatch_handles, labels):
-    print("Generating plot...")
-    plt.figure(figsize=(16, 16))
-
-    for i in range(len(x)):
-        plt.scatter(x[i], y[i], c=[cmap[labels[i]]])
-
-    plt.legend(handles=mpatch_handles)
-    plt.show()
-
-def display_word_plot(x, y, cmap, mpatch_handles, labels, surface_form):
-    print("Generating plot...")
-    plt.figure(figsize=(16, 16))
-
-    for i in range(len(x)):
-        plt.scatter(x[i], y[i], c=[cmap[labels[i]]])
-        plt.annotate(surface_form[i],
-                     xy=(x[i], y[i]),
-                     xytext=(5, 2),
-                     textcoords='offset points',
-                     ha='right',
-                     va='bottom')
-
-    plt.legend(handles=mpatch_handles)
-    plt.show()
-
-def create_color_handles(labels):
-    colormap = cm.colors.ListedColormap(cm.get_cmap('gist_ncar')(np.linspace(0,1,len(set(labels))+1)))
-    cmap = {}
-    for i in range(len(set(labels))):
-        cmap.update({list(set(labels))[i]: colormap.colors[i]})
-    mpatch_handles = []
-    for (btype, color) in cmap.items():
-        mpatch_handles.append(mpatches.Patch(color=color, label=btype))
-
-    return cmap, mpatch_handles
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['train-test',
-                                         'train-semcor',
-                                         'test',
-                                         'classify-file',
-                                         'classify-spv',
-                                         'cluster',
-                                         'word-cluster',
-                                         'polysem-cluster'])
+    parser.add_argument('mode',
+                        choices=['train-test',
+                                 'train-semcor',
+                                 'test',
+                                 'classify-file',
+                                 'classify-spv'],
+                        help="select a mode, modes indicate which basic-type module to run")
     parser.add_argument('-create-embeddings',
                         action='store_true',
                         default=False,
@@ -540,10 +411,6 @@ if __name__ == '__main__':
     parser.add_argument('-input-file',
                         default=None,
                         help="input file for classify-file mode")
-    parser.add_argument('-w',
-                        default=None,
-                        type=str,
-                        help="word input for word cluster model")
     args = parser.parse_args()
     mode = args.mode
     if args.model == "test":
@@ -552,7 +419,7 @@ if __name__ == '__main__':
         model = args.model
 
     if mode == 'train-test':
-        train_test(args.creat_embeddings)
+        train_test(args.create_embeddings)
     elif mode == 'train-semcor':
         train(args.create_embeddings)
     elif mode == 'test':
@@ -568,13 +435,3 @@ if __name__ == '__main__':
             print("Error: No input file provided.")
     elif mode == 'classify-spv':
         run_classifier_on_spv1()
-    elif mode == 'cluster':
-        model_cluster(model)
-    elif mode == 'word-cluster':
-        word = args.w
-        if word:
-            word_cluster(model, word)
-        else:
-            print("Error: No input word provided.")
-    elif mode == 'polysem-cluster':
-        polysem_cluster(model)
