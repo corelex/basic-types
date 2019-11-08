@@ -34,7 +34,7 @@ TODO:
 
 import sys
 from collections import Counter
-from semcor import load_semcor, SemcorFile
+from semcor import Semcor, SemcorFile
 from ansi import BLUE, GREY, END
 from utils import kwic_line
 
@@ -83,7 +83,7 @@ def print_pn_info(pns):
         for subkey, count in pns[key].items():
             print("     %4d  %s=%s" % (count, key, subkey))
     print()
-    
+
 
 def print_weird_rdfs(forms):
     lemmas = {}
@@ -100,11 +100,40 @@ def print_weird_rdfs(forms):
                 fh.write("%s %s%s%s\n" % (line, GREY, lemma, END))
 
 
+def count_basic_types(sc):
+    """Counts how often noun tokens go with a particular count of basic types."""
+    instances = 0
+    btypes_count = []
+    word_sets_per_btype_size = []
+    for i in range(21):
+        word_sets_per_btype_size.append(set())
+    for file in sc.files:
+        for wf in file.forms:
+            if wf.pos != 'NN':
+                continue
+            btypes = []
+            synsets = sc.synset_idx.get(wf.lemma,{}).values()
+            synsets = [ss for ss in synsets if ss.cat == 'noun']
+            for synset in synsets:
+                btypes.extend(synset.btypes.split())
+            instances += 1
+            btypes_count.append(len(set(btypes)))
+            word_sets_per_btype_size[len(set(btypes))].add(wf.lemma)
+            if len(set(btypes)) > 8:
+                print(len(set(btypes)), wf.lemma)
+    print("INSTANCES: %d" % instances)
+    print("TYPE_COUNT: %s" % Counter(btypes_count))
+    print("\nWORD_SET_PER_COUNT:")
+    for i in range(21):
+        words = word_sets_per_btype_size[i]
+        print(i, len(words), list(words)[:5])
+
+
 if __name__ == '__main__':
 
     maxfiles = int(sys.argv[1]) if len(sys.argv) > 1 else 999
 
-    sc = load_semcor(maxfiles)
+    sc = Semcor(maxfiles)
 
     # basic statistics on all attributes
     raw_attributes = { 'list': [], 'dict': None }
@@ -124,3 +153,5 @@ if __name__ == '__main__':
     print_attr_info(raw_attributes, attribute_index)
     print_pn_info(pns)
     print_weird_rdfs(weird_rdfs)
+
+    count_basic_types(sc)

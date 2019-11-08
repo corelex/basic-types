@@ -1,55 +1,21 @@
-#!/usr/bin/env/python
-
-"""basic-types.py
-
-Module for creating and running the basic types classifier.
-
-Usage
-
-$ python3 basic-types.py train-semcor
-
-    Train a classifier from all of Semcor and save it in
-    ../data/classifier-all.pickle. Use flag -create-embedding to save new word embeddings for this model.
-    Default off.
-
-$ python3 basic-types.py train-test
-
-    Train a classifier from a fragment of Semcor (two files) and save it in
-    ../data/classifier-002.pickle, for testing and debugging purposes.
-    Use flag -create-embedding to save new word embeddings for this model.
-    Default off.
-
-$ python3 basic-types.py test
-
-    Test the classifier on a feature set and test the evaluation code.
-
-$ python3 basic-types.py classify-file -input-file FILENAME
-
-    Run the classifier on filename, output will be written to the terminal. Specify the file with the -f option.
-
-$ python3 basic-types.py classify-spv1
-
-    Run the classifier on all SPV1 files, output will be written to the out/
-    directory.
-
-The "classify-file" and "classify-spv1" invocations both require the NLTK CoreNLPDependencyParser which
-assumes that the Stanford CoreNLP server is running at port 9000. To use the
-server run the following from the corenlp directory:
-
-$ java -mx4g -cp "*" edu.stanford.nlp.pipeline.StanfordCoreNLPServer -preload tokenize,ssplit,pos,lemma,depparse -status_port 9000 -port 9000 -timeout 15000
-
-Note that this invocation does not allow you browser access to port 9000 because
-the homepage uses an annotator that is not loaded by the above command.
-
-"""
-import argparse, codecs, csv, glob, json, pickle, os, sys
+import argparse
+import csv
 import itertools
+import sys, os
 
-from bert_embedding import BertEmbedding
-import nltk
-from nltk.corpus import wordnet as wn
-from nltk.parse.corenlp import CoreNLPDependencyParser
+from modules import cltypes
 from semcor import Semcor, SemcorFile
+
+from nltk.corpus import wordnet as wn
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.metrics import accuracy_score
+# from sklearn.model_selection import KFold
+# from sklearn.model_selection import cross_validate
+# from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import LogisticRegression
 from tqdm import tqdm
 
 
@@ -57,381 +23,379 @@ SC_SENT = '../data/semcor.sent.tsv'
 SC_TOKEN_FT = '../data/semcor.token.tsv'
 SC_TOKEN_FT_SMALL = '../data/semcor.token.tsv.10000'
 SC_TOKEN_DEP = '../data/semcor.token.fv'
+POS = ['NN', 'NNP']
+BASIC_TYPES = {key:[type.split('.')[0] for type in value[0][1].split()]
+               for (key, value) in cltypes.BASIC_TYPES_3_1.items()}
+
+sys.path.append(os.getcwd())
+
+class SemcorCorpus:
+    def __init__(self, file, model_name):
+        self.tsv_ids = self.extract_tsv_data(file)
+        self.semcor = self.create_semcor(model_name)
+        self.sen_list = [file.get_sentences() for file in self.semcor.files]
+        self.elements = self.extract_basic_type_objects()
+
+    def extract_tsv_data(self, file):
+        with open(file) as tsvfile:
+            reader = csv.reader(tsvfile, delimiter='\t')
+            data = [row for row in reader]
+            tsv_ids = {}
+            for semcor_token_item in data:
+                token_identifier = (semcor_token_item[1], semcor_token_item[3])
+                data = {'token_id': semcor_token_item[0],
+                        'sent_id': semcor_token_item[1],
+                        'token_no': semcor_token_item[2],
+                        'surface': semcor_token_item[3],
+                        'lemma': semcor_token_item[4],
+                        'pos': semcor_token_item[5],
+                        'int_dom_token_no': semcor_token_item[9],
+                        'dom_token_id': semcor_token_item[10],
+                        'rel': semcor_token_item[11]
+                        }
+
+                tsv_ids.update({token_identifier: data})
+
+            return tsv_ids
+
+    def get_elements(self):
+        return self.elements
+
+    def create_semcor(self, model_name):
+        if model_name == "test":
+            semcor = Semcor(2)
+        else:
+            semcor = Semcor()
+
+        return semcor
+
+    def extract_basic_type_objects(self):
+        objects_list = []
+        for sentences in self.sen_list:
+            for sentence in sentences:
+                word_forms = sentence.elements
+                new_sentence = []
+                for word_form in word_forms:
+                    if word_form.is_word_form():
+                        basic_type = None
+                        sid = word_form.sid
+                        if word_form.synset is not None:
+                            basic_type = word_form.synset.btypes
+                        tsv_id = (sid, word_form.position)
+                        b_type = BasicTypeObject(surface=word_form.text,
+                                                 sentence=sentence,
+                                                 lemma=word_form.lemma,
+                                                 basic_type=basic_type,
+                                                 sid=word_form.sid,
+                                                 pos=word_form.pos,
+                                                 sentence_position=word_form.position)
+                        tsv_features = self.tsv_ids.get(tsv_id)
+                        if tsv_features:
+                            b_type.update_linking_rel(tsv_features['rel'])
+                            dom_id = tsv_features['int_dom_token_no']
+                            dom_features = self.tsv_ids.get((sid, dom_id))
+                            if dom_features:
+                                b_type.update_dom_lemma(dom_features['lemma'])
+                        new_sentence.append(b_type)
+                    else:
+                        new_sentence.append(word_form)
+                objects_list.append(new_sentence)
+        return objects_list
+
+class BasicTypeObject:
+    def __init__(self, surface, sentence, lemma, basic_type, sid, pos, sentence_position):
+        self.sentence = sentence
+        self.surface_form = surface
+        self.lemma = lemma
+        self.basic_type = basic_type
+        self.sentence_position = sentence_position
+        self.sid = sid
+        self.pos = pos
+        self.embedding = None
+        self.linking_rel = None
+        self.dom_lemma = None
+        self.corelex = None
+
+    def __str__(self):
+        b_type = "None"
+        if self.basic_type is not None:
+            b_type = str(self.basic_type)
+        return "<BasicTypeObj (" + self.surface_form + ", " + b_type +")>"
+
+    def get_basic_type(self):
+        return self.basic_type
+
+    def is_basic_type(self):
+        return True
+
+    def is_punctuation(self):
+        return False
+
+    def update_linking_rel(self, linking_rel):
+        self.linking_rel = linking_rel
+
+    def update_dom_lemma(self, dom_lemma):
+        self.dom_lemma = dom_lemma
+
+    def update_corelex(self, corelex):
+        self.corelex = corelex
+
+    def get_corelex(self):
+        return self.corelex
+
+class BasicTyper:
+    def __init__(self, feature_extractor, classifier_type, model_name):
+        self.feature_extractor = feature_extractor
+        self.model_name = model_name
+        self.classifier = self.set_classifier(classifier_type)
+        self.featurized_data = {}
 
 
-def extract_token_tsv_data(file):
-    with open(file) as tsvfile:
-        reader = csv.reader(tsvfile, delimiter='\t')
-        data = [row for row in reader]
-        sentences = {}
-        for semcor_token_item in data:
-            sentence_id = semcor_token_item[1]
-            surface_token = semcor_token_item[3]
-            if sentence_id in sentences:
-                sentences[sentence_id].append(surface_token)
+    def set_classifier(self, classifier_type):
+        if classifier_type == "NaiveBayes":
+            return MultinomialNB()
+        else:
+            return LogisticRegression(random_state=0, solver='lbfgs', multi_class='multinomial')
+
+
+    def featurize_corpus(self, semcor_corpus, train_split):
+        #TODO: Add ability to k-fold training per PA feedback
+        feature_dictionaries = []
+        label_list = []
+        instance_list = []
+        elements = semcor_corpus.get_elements()
+        for sen in tqdm(elements, desc="Featurizing sentences"):
+            features = self.feature_extractor.extract(sen)
+            labels = self.feature_extractor.label_extract(sen)
+            instances = self.feature_extractor.instance_extract(sen)
+            feature_dictionaries.extend(features)
+            label_list.extend(labels)
+            instance_list.extend(instances)
+
+        vectorizer = DictVectorizer(dtype=np.uint8, sparse=True)
+        X = vectorizer.fit_transform(feature_dictionaries)
+        y = np.asarray(label_list)
+
+        self.X = X
+        self.y = y
+
+        idx = int(self.X.shape[0]*train_split)
+        self.featurized_data.update({'X_train': X[:idx],
+                                   'X_test': X[idx:],
+                                    'y_train': y[:idx],
+                                    'y_test':  y[idx:],
+                                    'train_instances': instance_list[:idx],
+                                    'test_instances': instance_list[idx:]})
+
+
+    def train(self):
+        X = self.featurized_data['X_train']
+        y = self.featurized_data['y_train']
+        print("Training classifier ...")
+        self.classifier.fit(X=X, y=y)
+
+
+    def predict(self):
+        X = self.featurized_data['X_test']
+        print("Predicting labels ...")
+        return self.classifier.predict(X=X)
+
+
+    def predict_probablities(self):
+        predicted_labels = []
+
+        X = self.featurized_data['X_test']
+        test_instances = self.featurized_data['test_instances']
+        probabilities = pd.DataFrame(self.classifier.predict_proba(X), columns=self.classifier.classes_)
+        row_count = probabilities.shape[0]
+
+        for i in range(0, row_count):
+            prob_instance = probabilities.iloc[i]
+            corelex = test_instances[i].get_corelex()
+            if corelex:
+                predicted_label = prob_instance[test_instances[i].get_corelex()].idxmax(axis=1)
             else:
-                sentences.update({sentence_id:[surface_token]})
+                predicted_label = prob_instance.idxmax(axis=1)
 
-        return data, sentences
+            predicted_labels.append(predicted_label)
 
-def extract_types(sc):
-    """
-    Returns a list of types from each wordform in semcor as well as a mapping
-    from integers to tokens.
-    """
-    types = []
-    mapping = {}
-    i = 0
-    sen_list = [file.get_sentences() for file in sc.files]
-    for sentences in sen_list:
-        for sentence in sentences:
-            wf = sentence.wfs
-            for form in wf:
-                i += 1
-                if form.is_word_form():
-                    if form.lemma is not None:
-                        mapping.update({str(i): form.lemma})
-                    else:
-                        mapping.update({str(i): form.text})
-                    if form.synset is not None:
-                            types.append(form.synset.btypes)
-                    else:
-                        types.append(None)
-                else:
-                    mapping.update({str(i): form.text})
-                    types.append(None)
+        return predicted_labels
 
-    return types, mapping
 
-def get_synset_features(surface: str):
-    synsets = wn.synsets(surface, pos=wn.NOUN)
+    def validate(self, predicted_labels):
+        y_true = self.featurized_data['y_test']
+        print(accuracy_score(y_true, predicted_labels))
 
-    synset_names = [synset.name() for synset in synsets]
-    name_indexes = ["ssid" + str(i) for i in range(0, len(synsets))]
-    hypernyms = [synset.name() for synset in list(itertools.chain.from_iterable([synset.hypernyms() for synset in synsets]))]
-    hypernym_indexes = ["hnid" + str(i) for i in range(0, len(hypernyms))]
 
-    path_hypernyms = [list(itertools.chain.from_iterable(synset.hypernym_paths())) for synset in synsets]
+class WindowedFeatureExtractor:
+    def __init__(self, feature_extractors, window_size: int):
+        self.feature_extractors = feature_extractors
+        self.window_size = window_size
 
-    if len(path_hypernyms) > 1:
-        path_hyp = [hypernym.name() for hypernym_list in path_hypernyms for hypernym in hypernym_list]
-        path_hyp_index = ["hpid" + str(i) for i in range(0, len(path_hypernyms))]
-        path_hypernym_feature = zip(path_hyp_index, path_hyp)
+    def extract(self, basic_types):
+        features = []
+        for current_idx in range(len(basic_types)):
+            instance = basic_types[current_idx]
+            if not instance.is_punctuation() and instance.pos in POS and instance.get_basic_type():
+                if len(instance.get_basic_type()) < 4:
+                    feature_dict = {}
+                    for feature_extractor in self.feature_extractors:
+                        for window_idx in range(-self.window_size, self.window_size+1):
+                            relative_idx = current_idx + window_idx
+                            if current_idx + window_idx >= 0 and current_idx + window_idx < len(basic_types):
+                                cur_instance = basic_types[relative_idx]
+                                feature_extractor.extract(cur_instance, window_idx, feature_dict)
+                    features.append(feature_dict)
+        return features
+
+    def label_extract(self, basic_types):
+        labels = []
+        for instance in basic_types:
+            if not instance.is_punctuation() and instance.pos in POS and instance.get_basic_type():
+                if len(instance.get_basic_type()) < 4:
+                    labels.append(instance.get_basic_type())
+        return labels
+
+    def instance_extract(self, basic_types):
+        instances = []
+        for instance in basic_types:
+            if not instance.is_punctuation() and instance.pos in POS and instance.get_basic_type():
+                if len(instance.get_basic_type()) < 4:
+                    instances.append(instance)
+        return instances
+
+
+class POSFeatureExtractor:
+    def extract(self, instance, window_idx, features):
+        if not instance.is_punctuation() and instance.pos:
+            features.update({'pos[' + str(window_idx) + ']=' + instance.pos: 1.0})
+
+
+class RelFeatureExtractor:
+    def extract(self, instance, window_idx, features):
+        if not instance.is_punctuation() and window_idx == 0:
+            rel = instance.linking_rel
+            if rel:
+                features.update({'rel=' + rel: 1.0})
+
+
+class ContextFeatureExtractor:
+    #TODO: maybe allow this feature to behavior differently w/r/t windows
+    def extract(self, instance, window_idx, features):
+        if not instance.is_punctuation() and window_idx != 0:
+            features.update({'context[' + str(window_idx) + ']=' + instance.surface_form: 1.0})
+        elif instance.is_punctuation() and window_idx != 0:
+            features.update({'context[' + str(window_idx) + ']=PUNC' : 1.0})
+
+class SynsetFeatureExtractor:
+    def extract(self, instance, window_idx, features):
+        if not instance.is_punctuation():
+            synsets = wn.synsets(instance.surface_form, pos=wn.NOUN)
+            synset_names = [synset.name() for synset in synsets]
+            feature_values = ['ssid' + str(i) + '[' + str(window_idx) + ']=' + synset_names[i] for i in range(0, len(synset_names))]
+            features.update(zip(feature_values, itertools.repeat(1.0)))
+
+
+class HypernymFeatureExtractor:
+    def extract(self, instance, window_idx, features):
+        if not instance.is_punctuation():
+            synsets = wn.synsets(instance.surface_form, pos=wn.NOUN)
+            hypernyms = [synset.name() for synset in
+                         list(itertools.chain.from_iterable([synset.hypernyms() for synset in synsets]))]
+            feature_values = ["hnid" + str(i) + '[' + str(window_idx) + ']=' + hypernyms[i] for i in range(0, len(hypernyms))]
+            # print(feature_values)
+            features.update(zip(feature_values, itertools.repeat(1.0)))
+
+
+class HypernymPathFeatureExtractor:
+    def extract(self, instance, window_idx, features):
+        if not instance.is_punctuation():
+            synsets = wn.synsets(instance.surface_form, pos=wn.NOUN)
+            path_hypernyms = [list(itertools.chain.from_iterable(synset.hypernym_paths())) for synset in synsets]
+
+            if len(path_hypernyms) > 1:
+                path_hyp = [hypernym.name() for hypernym_list in path_hypernyms for hypernym in hypernym_list]
+                feature_values = ["hpid" + str(i) + '[' + str(window_idx) + ']=' + path_hyp[i] for i in range(0, len(path_hyp))]
+                # print(path_hyp, instance.get_basic_type())
+                features.update(zip(feature_values, itertools.repeat(1.0)))
+
+
+class CorelexFeatureExtractor:
+    def extract(self, instance, window_idx, features):
+        if not instance.is_punctuation():
+            synsets = wn.synsets(instance.surface_form, pos=wn.NOUN)
+            path_hypernyms = [list(itertools.chain.from_iterable(synset.hypernym_paths())) for synset in synsets]
+            path_hyp = [hypernym.name().split('.')[0] for hypernym_list in path_hypernyms for hypernym in hypernym_list]
+            corelex = [key for (key, value) in BASIC_TYPES.items() for hym_name in value if hym_name in path_hyp]
+            instance.update_corelex(corelex)
+            feature_values = ["corelex" + str(i) + '[' + str(window_idx) + ']=' + corelex[i] for i in range(0, len(corelex))]
+            features.update(zip(feature_values, itertools.repeat(1.0)))
+
+
+def main(model_name, window, train_split, classifier_type, prediction_type):
+    features_in = SC_TOKEN_FT
+    sc = SemcorCorpus(file=features_in, model_name=model_name)
+
+    model = BasicTyper(
+        WindowedFeatureExtractor(
+            [
+                POSFeatureExtractor(),
+                RelFeatureExtractor(),
+                ContextFeatureExtractor(),
+                SynsetFeatureExtractor(),
+                HypernymFeatureExtractor(),
+                HypernymPathFeatureExtractor(),
+                CorelexFeatureExtractor()
+            ],
+            window),
+        classifier_type,
+        model_name)
+
+    model.featurize_corpus(sc, train_split)
+    model.train()
+
+    if prediction_type == "filtered":
+        predictions = model.predict_probablities()
     else:
-        path_hypernym_feature = None
+        predictions = model.predict()
 
-    return zip(name_indexes, synset_names), zip(hypernym_indexes, hypernyms), path_hypernym_feature
+    model.validate(predictions)
 
-def get_embedding_features(sentence_embedding, token_no):
-    # print(sentence_embedding)
-    token_vector = sentence_embedding[token_no][1][0]
-    if type(token_vector) is not str:
-        indexes = ["v" + str(i) for i in range(0, token_vector.size)]
-        vector_feature = [token_vector[i] for i in range(0, token_vector.size)]
-        return zip(indexes, vector_feature)
-    else:
-        return None
-
-
-def feature_set(types, token_features, identifier2token, sentence_embeddings):
-    mapped = zip(token_features, types)
-    feature_set = []
-    for i in mapped:
-        if i[1] is not None and len(i[1])<4:
-            features = i[0]
-            # indexs: [0] token_id, [1] sent_id, [2] token_no, [3] surface,[4] lemma, [5] pos, [6] sense_no, [7] sense_key, [8] ssid,
-            # [9] int_dom_token_no, [10] dom_token_id, [11] rel
-            # sentence_embedding = bert_embeddings[features[1]]
-            #if features[5] != 'VB'and type(sentence_embedding[int(features[2])-1][1]) is not str:
-            #TODO: Window Features, +/- 3
-            #TODO: Semantic context other nouns in the sentence, their types
-            #TODO: Verb in sentences
-            #TODO: Move to list features -> Sci-kit learn bayesian (sequences, BoW)
-            #TODO: Corelex btypes -> read notes, with details
-            #TODO: Run the MaxEnt version
-            print(features[11])
-            if features[5] != 'VB':
-                feature_dict = {
-                    "surface" : features[3],
-                    "lemma" : features[4],
-                    "pos" : features[5],
-                    "rel_to" : features[11],
-                }
-                if features[9] != '0':
-                    feature_dict.update({
-                        "int_dom_token": identifier2token[features[9]],
-                        "dom_token": identifier2token[features[10]],
-                    })
-                # embedding_features = get_embedding_features(sentence_embeddings[features[1]], int(features[2])-1)
-                # if embedding_features:
-                #     feature_dict.update(embedding_features)
-                synset, hypernym, path_hypernym = get_synset_features(features[3])
-                if synset:
-                    feature_dict.update(synset)
-                if hypernym:
-                    feature_dict.update(hypernym)
-                if path_hypernym:
-                    feature_dict.update(path_hypernym)
-
-                # print(feature_dict)
-                feature_set.append((feature_dict, i[1]))
-
-    return feature_set
-
-
-def split_data(feature_set):
-    index = int(len(feature_set) * .8)
-    training_set, test_set = feature_set[:index], feature_set[index:]
-    return training_set, test_set
-
-
-def train_classifier(training_set):
-    #TODO: Move to SciKit Learn, get rid of NLTK
-    #TODO: Look at most important feattures, potential bias in training time
-    # classifier = nltk.NaiveBayesClassifier.train(training_set)
-    classifier = nltk.MaxentClassifier.train(training_set)
-    return classifier
-
-def create_bert_embeddings(sentences, model_name):
-    number_of_sents = sent_count(model_name)
-    print("Creating embeddings from BERT...")
-    bert_embedding = BertEmbedding(model='bert_24_1024_16')
-    for i in tqdm(range(1, number_of_sents)):
-        sentences[str(i)] = bert_embedding(sentences[str(i)])
-    save_embeddings(sentences, model_name)
-    return sentences
-
-
-def save_classifier(classifier, name):
-    filename = '../data/classifier-%s.pickle' % name
-    print("Saving %s" % filename)
-    with open(filename, 'wb') as fh:
-        pickle.dump(classifier, fh)
-
-def save_embeddings(embeddings, name):
-    filename = '../data/embeddings-%s.pickle' % name
-    print("Saving %s" % filename)
-    with open(filename, 'wb') as fh:
-        pickle.dump(embeddings, fh)
-
-
-def load_classifier(name):
-    filename = '../data/classifier-%s.pickle' % name
-    print("Loading %s" % filename)
-    with open(filename, 'rb') as fh:
-        classifier = pickle.load(fh)
-    return classifier
-
-
-def save_test_features(features, name):
-    filename = '../data/test-features-%s.pickle' % name
-    print("Saving %s" % filename)
-    with open(filename, 'wb') as fh:
-        pickle.dump(features, fh)
-
-
-def load_test_features(name):
-    filename = '../data/test-features-%s.pickle' % name
-    print("Loading %s" % filename)
-    with open(filename, 'rb') as fh:
-        features = pickle.load(fh)
-    return features
-
-def load_embeddings(name):
-    filename = '../data/embeddings-%s.pickle' % name
-    print("Loading %s" % filename)
-    with open(filename, 'rb') as fh:
-        embeddings = pickle.load(fh)
-    return embeddings
-
-def evaluate_classifier(classifier, test_set):
-    """
-    :param classifier: classifier that has been trained on training set.
-    :param test_set: 20% of the featureset which includes features and a label.
-    :return: percentage accuracy of the classifier being able to label the data correctly based on features.
-    """
-    accuracy = nltk.classify.accuracy(classifier, test_set)
-    return accuracy
-
-
-def print_type_count(types):
-    count = len([t for t in types if t is not None])
-    print("Total number of types: %d" % len(types))
-    print("Number of non-nil types: %d" % count)
-
-
-def train_test(create_embeddings):
-    """Train a model on the first 2 files of Semcor, using the partial feature file
-    SC_TOKEN_FT_SMALL, this evaluates at 0.8808. Model and test features are
-    written to ../data."""
-    semcor = Semcor(2)
-    _train(semcor, SC_TOKEN_FT_SMALL, '002', create_embeddings)
-
-def train(create_embeddings):
-    """Train a model on all of Semcor, using the full feature file SC_TOKEN_FT, this
-    evaluates at 0.9334. Model and test features are written to ../data."""
-    semcor = Semcor()
-    _train(semcor, SC_TOKEN_FT, 'all', create_embeddings)
-
-def sent_count(model_name):
-    if model_name == "002":
-        return int(179)
-    else:
-        return int(439)
-
-def _train(semcor, features_in, model_name, create_embeddings):
-    token_features, sentences = extract_token_tsv_data(features_in)
-    if create_embeddings:
-        sentence_embeddings = create_bert_embeddings(sentences, model_name)
-    else:
-       sentence_embeddings =  load_embeddings(model_name)
-    types_from_semcor, identifier2token = extract_types(semcor)
-    print_type_count(types_from_semcor)
-    feature_data = feature_set(types_from_semcor, token_features, identifier2token, sentence_embeddings)
-    training_set, test_set = split_data(feature_data)
-    classifier = train_classifier(training_set)
-    print("Labels: %s" % classifier.labels())
-    accuracy = evaluate_classifier(classifier, test_set)
-    print("Accuracy on test set is %.4f" % accuracy)
-    save_classifier(classifier, model_name)
-    save_test_features(test_set, model_name)
-    #classifier.show_most_informative_features(20)
-    
-
-def test_classifier(classifier_name, test_set):
-    # just run one set of features through it
-    print("Running classifier on one set of features")
-    classifier = load_classifier(classifier_name)
-    features = {'pos': 'NN', 'rel': 'nsubj',
-                'sense_key': '1:09:00::', 'ssid': '05808619', 'sense_no': '1',
-                'dom_token': 'produce', 'int_dom_token': 'produce',
-                'lemma': 'investigation', 'surface': 'investigation'}
-    print(classifier.classify(features))
-    print("Evaluating classifier")
-    test_set = load_test_features(test_set)
-    print(classifier.labels())
-    accuracy = evaluate_classifier(classifier, test_set)
-    print("Accuracy on test set is %.4f" % accuracy)
-    classifier.show_most_informative_features(20)
-
-
-def run_classifier_on_file(fname_in, fname_out=None):
-    classifier = load_classifier('all')
-    lemmatizer = WordNetLemmatizer()
-    text = codecs.open(fname_in).read()
-    if fname_out is None:
-        fh_out = sys.stdout
-    else:
-        fh_out = codecs.open(fname_out, 'w')
-    sentences = nltk.sent_tokenize(text)
-    parser = CoreNLPDependencyParser(url='http://localhost:9000')
-    for sentence in sentences:
-        parses = parser.parse(nltk.word_tokenize(sentence))
-        for parse in parses:
-            for (gov, gov_pos), rel, (dep, dep_pos) in parse.triples():
-                if dep_pos in ('NN', 'NNS'):
-                    lemma = lemmatizer.lemmatize(dep)
-                    features = {'pos': dep_pos, 'rel': rel,
-                                'lemma': lemma, 'surface': dep,
-                                'dom_token': gov, 'int_dom_token': gov}
-                    label = classifier.classify(features)
-                    fh_out.write("%s\t%s\n" % (lemma, label))
-                    print(lemma, label)
-        print('')
-
-
-def run_classifier_on_string(classifier, lemmatizer, text, fname_out):
-    fh_out = codecs.open(fname_out, 'w')
-    sentences = nltk.sent_tokenize(text)
-    parser = CoreNLPDependencyParser(url='http://localhost:9000')
-    for sentence in sentences:
-        parses = parser.parse(nltk.word_tokenize(sentence))
-        for parse in parses:
-            for (gov, gov_pos), rel, (dep, dep_pos) in parse.triples():
-                if dep_pos in ('NN', 'NNS'):
-                    lemma = lemmatizer.lemmatize(dep)
-                    features = {'pos': dep_pos, 'rel': rel,
-                                'lemma': lemma, 'surface': dep,
-                                'dom_token': gov, 'int_dom_token': gov}
-                    label = classifier.classify(features)
-                    fh_out.write("%s\t%s\n" % (lemma, label))
-
-
-def run_classifier_on_spv1():
-    classifier = load_classifier('all')
-    lemmatizer = WordNetLemmatizer()
-    fnames = glob.glob('/DATA/dtra/spv1-results-lif-ela/documents/*.json')
-    for fname in fnames[:2]:
-        try:
-            with codecs.open(fname) as fh:
-                json_object = json.load(fh)
-                text = json_object['text']
-                print(fname, len(text))
-                outfile = os.path.join('out', os.path.basename(fname))
-                run_classifier_on_string(classifier, lemmatizer, text, outfile)
-        except:
-            print('ERROR')
-
-
-def tokentypevector(model_name):
-    token_features, sentences = extract_token_tsv_data(SC_TOKEN_FT_SMALL)
-    bert_embeddings = load_embeddings(model_name)
-    if model_name == '002':
-        semcor = Semcor(2)
-    else:
-        semcor = Semcor()
-    types_from_semcor, identifier2token = extract_types(semcor)
-    mapping = zip(token_features, types_from_semcor)
-    type2vector = []
-    for i in mapping:
-        if i[1] is not None and len(i[1])<4:
-            features = i[0]
-            sentence_embedding = bert_embeddings[features[1]]
-            type2vector.append((i[1], i[0][4], i[0][3], sentence_embedding[int(features[2])-1][1][0]))
-
-    return type2vector
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('mode',
-                        choices=['train-test',
-                                 'train-semcor',
-                                 'test',
-                                 'classify-file',
-                                 'classify-spv'],
-                        help="select a mode, modes indicate which basic-type module to run")
-    parser.add_argument('-create-embeddings',
-                        action='store_true',
-                        default=False,
-                        help="sets create new embeddings in training to true")
-    parser.add_argument('-model',
+    parser = argparse.ArgumentParser(description="A classifier to predict a noun's Corelex Basic Type.")
+    parser.add_argument('--mode',
+                        default='train-test',
+                        choices=['train-test'])
+    parser.add_argument('--model',
                         default='all',
                         choices=['all', 'test'],
-                        help="choose a model to run against")
-    parser.add_argument('-input-file',
-                        default=None,
-                        help="input file for classify-file mode")
+                        help="Choose the the model size you'd like to train and test against (default=all).")
+    parser.add_argument('--architecture',
+                        default="LogisticRegression",
+                        choices=['LogisticRegression', 'NaiveBayes'],
+                        help="Choose the model architecture you'd like to use (default=LogisticRegression).")
+    parser.add_argument('--window-size',
+                        default=0,
+                        type=int,
+                        help="Choose the size of the window on either side of a target token from which to generate "
+                             "features (default=0).")
+    parser.add_argument('--train-split',
+                        default=0.9,
+                        choices=np.arange(0.1, 0.9),
+                        type=float,
+                        metavar="[0.1-0.9]",
+                        help="Choice the percentage of data you'd like in the training set (default=0.9).")
+    parser.add_argument('--prediction-type',
+                        default='unfiltered',
+                        choices=['unfiltered', 'filtered'],
+                        help="Use the possible synsets as a filter for a token to limit the possible labels only to those"
+                             " that align with possible basic types (default=unfiltered).")
     args = parser.parse_args()
     mode = args.mode
-    if args.model == "test":
-        model = "002"
-    else:
-        model = args.model
 
-    if mode == 'train-test':
-        train_test(args.create_embeddings)
-    elif mode == 'train-semcor':
-        train(args.create_embeddings)
-    elif mode == 'test':
-        #     test the classifier with the full model on the 002 test set, gives
-        #     unrealistic results because the training data probably includes
-        #     the test data, just here to see whether the mechanism works
-        test_classifier('all', '002')
-    elif mode == 'classify-file':
-        filename = args.input_file
-        if filename:
-            run_classifier_on_file(filename)
-        else:
-            print("Error: No input file provided.")
-    elif mode == 'classify-spv':
-        run_classifier_on_spv1()
+    main(model_name=args.model,
+         window=args.window_size,
+         train_split=args.train_split,
+         classifier_type=args.architecture,
+         prediction_type=args.prediction_type)

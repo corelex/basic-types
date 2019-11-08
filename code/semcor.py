@@ -1,21 +1,21 @@
 """Interface to Semcor.
 
-Should run in both Python 2 and Python 3, but {Python 3 is recommended because
+Should run in both Python 2 and Python 3, but Python 3 is recommended because
 it is much faster for this code.
 
 
-Usage from command line:
+Basic usage from command line:
 
 $ python semcor.py --compile (-n MAXFILES)
 $ python semcor.py (-n MAXFILES)
 
 The first invocation compiles semcor files, the second loads compiled files. The
-default is to compile or load all files, this can be overruled with the -n
+default is to compile or load all files, this default can be overruled with the -n
 option.
 
-Usage as an imported module:
+Basic usage as an imported module:
 
->>> from semcor import Semcor
+>>> from semcor import Semcor, SemcorFile
 >>> sc = Semcor(10)
 
 The argument sets a limit to the number of files to load, without it all files
@@ -29,7 +29,13 @@ If sources have not yet been compiled you first need to do this:
 Here all files are compiled, you can add an integer-valued argument to restrict
 the number of files to compile.
 
-NOTE: this file was copied from the semcor repository
+
+Other uses:
+
+$ python semcor.py --export-nouns FILENAME
+
+Exports all nouns, with their synset and basic types to FILENAME. This uses the
+Semcor.export_nouns() method.
 
 """
 
@@ -45,7 +51,7 @@ from index import create_lemma_index, IndexedWordForms
 SEMCOR = '../data/semcor3.0'
 
 # The files are all the files in the brown1 and brown2 subcorpora of semcor. The
-# brownv subcorpus, which has verbs only, is not included. Files are sorted in
+# browny subcorpus, which has verbs only, is not included. Files are sorted in
 # lexicographic order with the subcorpus as part of the path so brown1/br-j03
 # will precede brown2/br-e22.
 SEMCOR_FILES = sorted(glob.glob(os.path.join(SEMCOR, 'brown[12]/tagfiles/*')))
@@ -161,7 +167,7 @@ class Semcor(object):
         t0 = time.time()
         self.files = []
         self.loaded = self.fcount if maxfiles > self.fcount else maxfiles
-        print('Loading compiled Semcor files...')
+        print('Loading compiled files...')
         for fname in self.fnames[:maxfiles]:
             pickle_file = pickle_file_name(fname)
             with open(pickle_file, 'rb') as fh:
@@ -247,7 +253,7 @@ class Semcor(object):
         senses = set()
         for scfile in self.files:
             for sent in scfile.get_sentences():
-                for wf in sent.wfs:
+                for wf in sent.elements:
                     if wf.has_sense():
                         senses.add("%s%%%s" % (wf.lemma, wf.lexsn))
         return senses
@@ -265,6 +271,19 @@ class Semcor(object):
             sub_idx = create_lemma_index(nouns)
             idx[scfile.fname] = sub_idx
         return idx
+
+    def export_nouns(self, fname):
+        """Export all nouns with their synset identifier and basic types to fname."""
+        fh = open(fname, 'w')
+        for file in sc.files:
+            for form in file.forms:
+                if form.pos != 'NN':
+                    continue
+                synset = form.synset
+                if synset is None:
+                    fh.write("%s\tNone\tNone\n" % form.lemma)
+                else:
+                    fh.write("%s\t%s\t%s\n" % (form.lemma, synset.ssid, synset.btypes))
 
 
 class SemcorFile(object):
@@ -353,7 +372,7 @@ class SemcorFile(object):
 
 if __name__ == '__main__':
 
-    options, args = getopt.getopt(sys.argv[1:], 'n:', ['compile'])
+    options, args = getopt.getopt(sys.argv[1:], 'n:', ['compile', 'export-nouns='])
     options = { name: value for (name, value) in options }
     maxfiles = int(options.get('-n', 999))
 
@@ -361,4 +380,7 @@ if __name__ == '__main__':
         compile_semcor(maxfiles)
     else:
         sc = Semcor(maxfiles)
-        print(sc)
+        if '--export-nouns' in options:
+            sc.export_nouns(options.get('--export-nouns'))
+        else:
+            print(sc)
