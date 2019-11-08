@@ -45,7 +45,7 @@ There should be no need to recompile the Semcor browser, but if you run into iss
 the usual solution. Details on the Semcor browser can be found below.  
 
 
-###Semcor Browser
+### Semcor Browser
 
 #### Prerequisites
 
