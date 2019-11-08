@@ -11,7 +11,8 @@ The current performance with the default configuration is .81445 accuracy.
 The module for running the classifier is basic_types.py. The packages required for running the classifier are documented
 in requirements.txt. Information on usage is accessible via the --help command.
 
-```usage: basic_types.py [-h] [--mode {train-test}] [--model {all,test}]
+```
+usage: basic_types.py [-h] [--mode {train-test}] [--model {all,test}]
                       [--architecture {LogisticRegression,NaiveBayes}]
                       [--window-size WINDOW_SIZE] [--train-split [0.1-0.9]]
                       [--prediction-type {unfiltered,filtered}]
