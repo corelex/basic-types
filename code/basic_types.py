@@ -1,33 +1,41 @@
 import argparse
+import codecs
 import csv
-from datetime import datetime
 import itertools
 import json
-from pathlib import Path
 import pickle
-import sys, os
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from subprocess import call
 
-from modules import cltypes
-from semcor import Semcor, SemcorFile
-
-from bert_embedding import BertEmbedding
-from nltk.corpus import wordnet as wn
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+# from bert_embedding import BertEmbedding
+import nltk
+from nltk.corpus import wordnet as wn
+from nltk.parse.corenlp import CoreNLPDependencyParser
+from nltk.stem import WordNetLemmatizer
 from sklearn.feature_extraction import DictVectorizer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import classification_report
 from sklearn.model_selection import KFold
 from sklearn.naive_bayes import MultinomialNB
-from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier, export_graphviz
-from subprocess import call
 from tqdm import tqdm
 
+from modules import cltypes
+from semcor import Semcor, SemcorFile
 
+sys.setrecursionlimit(100000)
 TIME = str(datetime.now().strftime("%Y-%m-%d_%H%M%S"))
 ALL_OUTPUT =  '../_experiments/model_all/' + TIME + '/'
 TEST_OUTPUT = '../_experiments/model_test/' + TIME + '/'
+MODEL_ALL_OUTPUT =  '../_models/model_all/' + TIME + '/'
+MODEL_TEST_OUTPUT = '../_models/model_test/' + TIME + '/'
 SC_SENT = '../data/semcor.sent.tsv'
 SC_TOKEN_FT = '../data/semcor.token.tsv'
 SC_TOKEN_FT_SMALL = '../data/semcor.token.tsv.10000'
@@ -97,7 +105,7 @@ class SemcorCorpus:
 
     def create_semcor(self, model_name):
         if model_name == "test":
-            semcor = Semcor(2)
+            semcor = Semcor(3)
         else:
             semcor = Semcor()
 
@@ -111,11 +119,6 @@ class SemcorCorpus:
                 # print(sentence)
                 sid = sentence
                 snt = [item for item in sentence.elements if item.is_word_form()]
-
-
-            #     snt = [item.text for item in sentence.elements]
-            #     sen_dict[sid] = [" ".join(snt)]
-                # sen_dict[sid] = snt
         return sen_dict
 
 
@@ -176,7 +179,7 @@ class SemcorCorpus:
 
 
 class BasicTypeObject:
-    def __init__(self, surface, sentence, lemma, basic_type, sid, pos, sentence_position, synset):
+    def __init__(self, surface, sentence, lemma, pos, basic_type=None, sid=None, sentence_position=None, synset=None):
         self.sentence = sentence
         self.surface_form = surface
         self.lemma = lemma
@@ -263,6 +266,7 @@ class BasicTypeObject:
 
 class BasicTyper:
     def __init__(self, feature_extractor, classifier_type, model_name):
+        self.classifier_type = classifier_type
         self.feature_extractor = feature_extractor
         self.model_name = model_name
         self.classifier = self.set_classifier(classifier_type)
@@ -274,7 +278,7 @@ class BasicTyper:
         if classifier_type == "NaiveBayes":
             return MultinomialNB()
         elif classifier_type == "DecisionTree":
-            return DecisionTreeClassifier()
+            return DecisionTreeClassifier(random_state=0, min_samples_split=10, max_depth=200)
         else:
             return LogisticRegression(random_state=0, solver='lbfgs', max_iter=1000, multi_class='multinomial')
 
@@ -302,6 +306,7 @@ class BasicTyper:
         self.metadata = {
                     'metadata': {
                         'model': self.model_name,
+                        'architecture': self.classifier_type,
                         'date_run': TIME,
                         'features': str(self.feature_extractor.get_feature_extractors()),
                         'window_size': self.feature_extractor.get_window_size(),
@@ -311,9 +316,9 @@ class BasicTyper:
         print(self.metadata)
         if print_features:
             if self.model_name == 'all':
-                feature_output_file = ALL_OUTPUT + 'features_' + '.jsonl'
+                feature_output_file = ALL_OUTPUT + 'features' + '.jsonl'
             else:
-                feature_output_file = TEST_OUTPUT + 'features_' + '.jsonl'
+                feature_output_file = TEST_OUTPUT + 'features' + '.jsonl'
             with open(feature_output_file, 'a+') as jsonl:
                 json.dump(self.metadata, jsonl, indent=4)
                 for i in range(len(instances)):
@@ -333,21 +338,6 @@ class BasicTyper:
         self.X = X
         self.y = y
         self.instance_list = instances
-
-        # row_count = self.X.shape[0]
-        # print("instances: ", row_count)
-
-        # train_idx = int(row_count*train_split)
-        # dev_idx = train_idx + int((row_count-train_idx)/2)
-        # self.featurized_data.update({'X_train': X[:train_idx],
-        #                              'X_dev': X[train_idx:dev_idx],
-        #                              'X_test': X[dev_idx:],
-        #                              'y_train': y[:train_idx],
-        #                              'y_dev':  y[train_idx:dev_idx],
-        #                              'y_test': y[dev_idx:],
-        #                              'train_instances': instance_list[:train_idx],
-        #                              'dev_instances': instance_list[train_idx:dev_idx],
-        #                              'test_instances': instance_list[dev_idx:]})
 
 
     def naive_debias(self, features, labels, instances):
@@ -387,11 +377,98 @@ class BasicTyper:
         print("Training classifier ...")
         self.classifier.fit(X=X_train, y=y_train)
         predictions = self.predict(X_test)
-        print("\nraw_predictions: ", self.validate(predictions, y_test)
-              )
-        export_graphviz(self.classifier, out_file='tree.dot', feature_names=self.feature_names,
+
+        print("\nraw_predictions: ", self.validate(predictions, y_test))
+        relevant_probablities = self.filtered_probabilities(X_test, y_test, predictions)
+        if self.model_name == 'all':
+            prediction_output_file = ALL_OUTPUT + 'predictions' + '.jsonl'
+            dot_output_file = ALL_OUTPUT + 'tree_' + TIME + '.dot'
+            svg_output_file = ALL_OUTPUT + 'tree_' + TIME + '.svg'
+        else:
+            prediction_output_file = TEST_OUTPUT + 'predictions' + '.jsonl'
+            dot_output_file = TEST_OUTPUT + 'tree_' + TIME + '.dot'
+            svg_output_file = TEST_OUTPUT  + 'tree_' + TIME + '.svg'
+
+        with open(prediction_output_file, 'a') as jsonl:
+            test_features = self.vectorizer.inverse_transform(X_test)
+            json.dump(self.metadata, jsonl, indent=4)
+            for i in range(len(test_features)):
+                if y_test[i] == predictions[i]:
+                    misclassified = False
+                else:
+                    misclassified = True
+                prediction_validation = {
+                    'architecture': self.classifier_type,
+                    'features': str(test_features[i]),
+                    'true_label': y_test[i],
+                    'predicted_label': predictions[i],
+                    'probabilities': relevant_probablities[i].to_dict(),
+                    'misclassified': misclassified
+                }
+                json.dump(prediction_validation, jsonl, indent=4)
+
+        export_graphviz(self.classifier, out_file=dot_output_file, feature_names=self.feature_names,
                         class_names=self.classifier.classes_)
-        # call(['dot', '-T', 'png', 'tree.dot', '-o', 'tree.png'])
+        call(['dot', '-Tsvg', dot_output_file, '-o', svg_output_file])
+        self.save_classifier()
+
+
+    def tree_effectiveness(self, train_split):
+        row_count = self.X.shape[0]
+        train_idx = int(row_count * train_split)
+        X_train, X_test = self.X[:train_idx], self.X[train_idx:]
+        y_train, y_test = self.y[:train_idx], self.y[train_idx:]
+
+        path = self.classifier.cost_complexity_pruning_path(X_train, y_train)
+        ccp_alphas, impurities = path.ccp_alphas, path.impurities
+
+        fig, ax = plt.subplots()
+        ax.plot(ccp_alphas[:-1], impurities[:-1], marker='o', drawstyle="steps-post")
+        ax.set_xlabel("effective alpha")
+        ax.set_ylabel("total impurity of leaves")
+        ax.set_title("Total Impurity vs effective alpha for training set")
+
+        clfs = []
+        for ccp_alpha in ccp_alphas:
+            clf = DecisionTreeClassifier(random_state=0, ccp_alpha=ccp_alpha)
+            clf.fit(X_train, y_train)
+            clfs.append(clf)
+        print("Number of nodes in the last tree is: {} with ccp_alpha: {}".format(
+            clfs[-1].tree_.node_count, ccp_alphas[-1]))
+
+        clfs = clfs[:-1]
+        ccp_alphas = ccp_alphas[:-1]
+
+        node_counts = [clf.tree_.node_count for clf in clfs]
+        depth = [clf.tree_.max_depth for clf in clfs]
+        fig, ax = plt.subplots(2, 1)
+        ax[0].plot(ccp_alphas, node_counts, marker='o', drawstyle="steps-post")
+        ax[0].set_xlabel("alpha")
+        ax[0].set_ylabel("number of nodes")
+        ax[0].set_title("Number of nodes vs alpha")
+        ax[1].plot(ccp_alphas, depth, marker='o', drawstyle="steps-post")
+        ax[1].set_xlabel("alpha")
+        ax[1].set_ylabel("depth of tree")
+        ax[1].set_title("Depth vs alpha")
+        fig.tight_layout()
+
+        train_scores = [clf.score(X_train, y_train) for clf in clfs]
+        test_scores = [clf.score(X_test, y_test) for clf in clfs]
+
+        fig, ax = plt.subplots()
+        ax.set_xlabel("alpha")
+        ax.set_ylabel("accuracy")
+        ax.set_title("Accuracy vs alpha for training and testing sets")
+        ax.plot(ccp_alphas, train_scores, marker='o', label="train",
+                drawstyle="steps-post")
+        ax.plot(ccp_alphas, test_scores, marker='o', label="test",
+                drawstyle="steps-post")
+        ax.legend()
+        if self.model_name == "all":
+            filepath = ALL_OUTPUT + 'tree_analysis.png'
+        else:
+            filepath = TEST_OUTPUT + 'tree_analysis.png'
+        plt.savefig(filepath)
 
     def k_fold(self):
         KF.get_n_splits(self.X)
@@ -409,9 +486,9 @@ class BasicTyper:
             # print("filtered_predictions: ", self.validate(filter_predictions, y_test))
 
         if self.model_name == 'all':
-            prediction_output_file = ALL_OUTPUT + 'predictions_' + '.jsonl'
+            prediction_output_file = ALL_OUTPUT + 'predictions' + '.jsonl'
         else:
-            prediction_output_file = TEST_OUTPUT + 'predictions_' + '.jsonl'
+            prediction_output_file = TEST_OUTPUT + 'predictions' + '.jsonl'
 
         with open(prediction_output_file, 'a') as jsonl:
             test_features = self.vectorizer.inverse_transform(X_test)
@@ -432,6 +509,7 @@ class BasicTyper:
 
             print(classification_report(predictions, y_test))
             self.most_informative_features()
+            self.save_classifier()
 
     def predict(self, X):
         # X = self.featurized_data['X_dev']
@@ -440,7 +518,7 @@ class BasicTyper:
 
 
     def predict_probablities(self, X):
-        #TODO: figure out how to extract Corelex
+        #TODO: Extract Corelex
         predicted_labels = []
         id_attributes = []
         probabilities = pd.DataFrame(self.classifier.predict_proba(X), columns=self.classifier.classes_)
@@ -484,10 +562,27 @@ class BasicTyper:
                               "\n\t".join(self.feature_names[j] for j in top_features)))
 
     def save_classifier(self):
-        filename = '../data/classifier-%s.pickle' % self.model_name
+        if self.model_name == 'all':
+            filepath = MODEL_ALL_OUTPUT
+        else:
+            filepath= MODEL_TEST_OUTPUT
+        filename = filepath + 'classifier.pickle'
         print("Saving %s" % filename)
         with open(filename, 'wb') as fh:
-            pickle.dump(self.model, fh)
+            pickle.dump(self.classifier, fh)
+        self.save_vectorizer()
+
+
+    def save_vectorizer(self):
+        if self.model_name == 'all':
+            filepath = MODEL_ALL_OUTPUT
+        else:
+            filepath= MODEL_TEST_OUTPUT
+        filename = filepath + 'vectorizer.pickle'
+        print("Saving %s" % filename)
+        with open(filename, 'wb') as fh:
+            pickle.dump(self.vectorizer, fh)
+
 
 class BertWordEmbeddings:
     def __init__(self, corpus, model_name):
@@ -579,6 +674,9 @@ class RelFeatureExtractor:
                 features.update({'rel=' + rel: 1.0})
 
 class DependencyFeatureExtractor:
+    def __repr__(self):
+        return 'DependencyFeatureExtractor'
+
     def extract(self, instance, window_idx, cap, features):
         if not instance.is_punctuation() and window_idx == 0:
             dom = instance.dom_lemma
@@ -587,6 +685,9 @@ class DependencyFeatureExtractor:
                 features.update({'dep=' + rel + '_'+ dom: 1.0})
 
 class DependencySynsetFeatureExtractor:
+    def __repr__(self):
+        return 'DependencySynsetFeatureExtractor'
+
     def extract(self, instance, window_idx, cap, features):
         if not instance.is_punctuation() and window_idx == 0:
             rel = instance.linking_rel
@@ -600,16 +701,20 @@ class DependencySynsetFeatureExtractor:
                 features.update(zip(feature_values, itertools.repeat(1.0)))
 
 class DependencyHyperFeatureExtractor:
+    def __repr__(self):
+        return 'DependencyHypernymFeatureExtractor'
+
     def extract(self, instance, window_idx, cap, features):
         if not instance.is_punctuation() and window_idx == 0:
             dom = instance.dom_surface
+            rel = instance.linking_rel
             if dom:
                 synsets = wn.synsets(dom)
+                if cap < len(synsets):
+                    synsets = synsets[:cap]
                 hypernyms = list(set([synset.name() for synset in
                              list(itertools.chain.from_iterable([synset.hypernyms() for synset in synsets]))]))
-                if cap > len(hypernyms):
-                    cap = len(hypernyms)
-                feature_values = ['dephyperid=' + hypernyms[i] for i in range(0, cap)]
+                feature_values = ['dephyper=' + rel + '_' + hypernyms[i] for i in range(0, len(hypernyms))]
                 features.update(zip(feature_values, itertools.repeat(1.0)))
 
 class DomLemmaFeatureExtractor:
@@ -642,7 +747,6 @@ class DomHyperFeatureExtractor:
                 features.update(zip(feature_values, itertools.repeat(1.0)))
 
 class ContextFeatureExtractor:
-    #TODO: maybe allow this feature to behavior differently w/r/t windows
     def extract(self, instance, window_idx, cap,  features):
         if not instance.is_punctuation() and window_idx != 0:
             # features.update({'context[' + str(window_idx) + ']=' + instance.surface_form: 1.0})
@@ -691,29 +795,59 @@ class WordVectorFeature():
     def __init__(self, bert, scaling: float = 1.0) -> None:
         self.scaling = scaling
         self.word_vectors = bert.get_embeddings()
-        # self.indexes = ["v" + str(i) for i in range(0, self.word_vectors.dim)]
 
     def extract(self, instance, window_idx, cap, features) -> None:
         if not instance.is_punctuation() and window_idx == 0:
             print(self.word_vectors['1'])
             print(instance.sid)
-
             sen_vector = self.word_vectors.get(instance.sid)
-            # print(type(sen_vector[0]))
-            # print(instance)
-            # vector = sen_vector[instance.sentence_position][1]
-            # exit(0)
-            # vector_feature = [np.multiply(vector[i], self.scaling) for i in range(0, vector.size)]
-            # print(vector)
-            # features.update(zip(self.indexes, vector_feature))
 
-def main(model_name, window, train_split, classifier_type, prediction_type, cap, print_features, use_embeddings=False):
+
+def load_classifier(filepath):
+    print("Loading %s" % filepath)
+    with open(filepath, 'rb') as fh:
+        classifier = pickle.load(fh)
+    return classifier
+
+def load_vecotrizer(filepath):
+    print("Loading %s" % filepath)
+    with open(filepath, 'rb') as fh:
+        vectorizer = pickle.load(fh)
+    return vectorizer
+
+def load_feature_extractors(model_path):
+    feature_extractor_path = model_path + 'feature_extractor.pickle'
+    with open(feature_extractor_path, 'rb') as fh:
+        feature_extractors = pickle.load(fh)
+    return feature_extractors
+
+def train_main(model_name,
+         window,
+         train_split,
+         classifier_type,
+         prediction_type,
+         cap,
+         print_features,
+         tree_analysis,
+         use_embeddings,
+         feature_type):
     if model_name == 'test':
         if not os.path.exists(TEST_OUTPUT):
             os.makedirs(TEST_OUTPUT)
+        if not os.path.exists(MODEL_TEST_OUTPUT):
+            os.makedirs(MODEL_TEST_OUTPUT)
+
+        feature_extractor_output_file = MODEL_TEST_OUTPUT + 'feature_extractor.pickle'
     else:
         if not os.path.exists(ALL_OUTPUT):
             os.makedirs(ALL_OUTPUT)
+        if not os.path.exists(MODEL_ALL_OUTPUT):
+            os.makedirs(MODEL_ALL_OUTPUT)
+
+        feature_extractor_output_file = MODEL_ALL_OUTPUT + 'feature_extractor.pickle'
+
+    with open(feature_extractor_output_file, 'wb') as pf:
+        pickle.dump(feature_type, pf)
 
     features_in = SC_TOKEN_FT
     sc = SemcorCorpus(file=features_in, model_name=model_name)
@@ -726,22 +860,7 @@ def main(model_name, window, train_split, classifier_type, prediction_type, cap,
 
     model = BasicTyper(
         WindowedFeatureExtractor(
-            [
-                # POSFeatureExtractor(),
-                # RelFeatureExtractor(),
-                DependencyFeatureExtractor(),
-                # DependencySynsetFeatureExtractor(),
-                # DependencyHyperFeatureExtractor(),
-                # ContextFeatureExtractor(),
-                # SynsetFeatureExtractor(),
-                # HypernymFeatureExtractor(),
-                # HypernymPathFeatureExtractor(),
-                # CorelexFeatureExtractor(),
-                # DomLemmaFeatureExtractor(),
-                # DomSynsetFeatureExtractor(),
-                # WordVectorFeature(bert)
-
-            ],
+            feature_type,
             window,
             cap),
         classifier_type,
@@ -749,9 +868,15 @@ def main(model_name, window, train_split, classifier_type, prediction_type, cap,
 
     model.featurize_corpus(sc, print_features)
 
-    model.train(train_split)
-    # model.k_fold()
+    if classifier_type == "DecisionTree":
+        if tree_analysis:
+            model.tree_effectiveness(train_split)
+        else:
+            model.train(train_split)
+    else:
+        model.k_fold()
 
+    #TODO: Enable Basic Type Filtering
     # if prediction_type == "filtered":
     #     predictions = model.predict_probablities()
     # else:
@@ -759,23 +884,79 @@ def main(model_name, window, train_split, classifier_type, prediction_type, cap,
 
     # predictions = model.predict()
     # model.validate(predictions)
+
     # model.most_informative_features()
+
+def featurize4classification(parse, sentence, lemmatizer, feature_extractors):
+    features = []
+    for (gov, gov_pos), rel, (dep, dep_pos) in  parse.triples():
+        if dep_pos in ['NN', 'NNS']:
+            lemma = lemmatizer.lemmatize(dep)
+            dom_lemma = lemmatizer.lemmatize(gov)
+            b_type = BasicTypeObject(surface=dep,
+                                     sentence=sentence,
+                                     lemma=lemma,
+                                     pos=dep_pos)
+            b_type.update_linking_rel(rel)
+            b_type.update_dom_surface(gov)
+            b_type.update_dom_pos(gov_pos)
+            b_type.update_dom_lemma(dom_lemma)
+
+            feature_dict = {}
+            for feature_extractor in feature_extractors:
+                feature_extractor.extract(instance=b_type, features=feature_dict, window_idx=0, cap=3)
+            features.append((feature_dict, lemma))
+
+    return features
+
+
+def classify_main(model_path, fi, fo=None):
+    feature_extractors = load_feature_extractors(model_path)
+    classifier = load_classifier(model_path + 'classifier.pickle')
+    vectorizer = load_vecotrizer(model_path + 'vectorizer.pickle')
+    lemmatizer = WordNetLemmatizer()
+    text = codecs.open(fi).read()
+    if fo is None:
+      fh_out = sys.stdout
+    else:
+      fh_out = codecs.open(fo, 'w')
+    sentences = nltk.sent_tokenize(text)
+    parser = CoreNLPDependencyParser(url='http://localhost:9000')
+    all_featurized_data = []
+    for sentence in sentences:
+        parses = parser.parse(nltk.word_tokenize(sentence))
+        for parse in parses:
+            featurized_data = featurize4classification(parse, sentence, lemmatizer, feature_extractors)
+            all_featurized_data.extend(featurized_data)
+
+    for (features, lemma) in all_featurized_data:
+        X = vectorizer.transform(features)
+        label = classifier.predict(X)
+        fh_out.write("%s\t%s\n" % (lemma, label[0]))
+        print('')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="A classifier to predict a noun's Corelex Basic Type.")
     parser.add_argument('--mode',
-                        default='train-test',
-                        choices=['train-test'])
-    parser.add_argument('--model',
+                        default='train',
+                        choices=['train', 'classify'],
+                        help = "Choose the whether you'd like to run in classify or train mode. Note: classify mode "
+                               "requires an input file to classify and allows an optional output file(default=train)")
+    parser.add_argument('--training-size',
                         default='test',
                         choices=['all', 'test'],
-                        help="Choose the the model size you'd like to train and test against (default=all).")
+                        help="Choose the the model size you'd like to train and test against (default=test).")
     parser.add_argument('--architecture',
-                        default="DecisionTree",
+                        default="LogisticRegression",
                         choices=['LogisticRegression', 'NaiveBayes', 'DecisionTree'],
                         help="Choose the model architecture you'd like to use (default=LogisticRegression).")
+    parser.add_argument('--features', #TODO: Enable Lemma Feature, allow mulitple?
+                        default="dep",
+                        choices=['dep', 'depsynset', 'dephypernym'],
+                        help="Choose the feature type (default=dep).")
     parser.add_argument('--window-size',
-                        default=2,
+                        default=0,
                         type=int,
                         help="Choose the size of the window on either side of a target token from which to generate "
                              "features (default=0).")
@@ -798,14 +979,40 @@ if __name__ == '__main__':
                         help='Prints features to a .jsonl file.',
                         action='store_true',
                         default=False)
+    parser.add_argument('-tree-analysis',
+                        help='Analyzes decision tree characteristics.',
+                        action='store_true',
+                        default=False)
+    parser.add_argument('--input',
+                        default=None,
+                        type=str,
+                        help="Input text file for classification. (default=None)")
+    parser.add_argument('--model-dir',
+                        default=None,
+                        type=str,
+                        help="Path to the model director (default=None)")
     args = parser.parse_args()
     mode = args.mode
+    model = args.training_size
+    feature_extractor = {'dep': [DependencyFeatureExtractor()],
+                'depsynset': [DependencySynsetFeatureExtractor()],
+                'dephypernym': [DependencyHyperFeatureExtractor()]}
 
-    main(model_name=args.model,
-         window=args.window_size,
-         train_split=args.train_split,
-         classifier_type=args.architecture,
-         prediction_type=args.prediction_type,
-         cap=args.cap,
-         print_features=args.print_features,
-         use_embeddings=False)
+    if mode == 'train':
+        train_main(model_name=model,
+             window=args.window_size,
+             train_split=args.train_split,
+             classifier_type=args.architecture,
+             prediction_type=args.prediction_type,
+             cap=args.cap,
+             print_features=args.print_features,
+             tree_analysis=args.tree_analysis,
+             use_embeddings=False,
+             feature_type=feature_extractor[args.features])
+    elif mode == 'classify':
+        if not args.input:
+            exit(1)
+        elif not args.model_dir:
+            exit(1)
+        else:
+            classify_main(model_path=args.model_dir, fi=args.input)

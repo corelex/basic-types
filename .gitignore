@@ -2,3 +2,6 @@
 code/__pycache__
 code/out
 code/btypes-*.txt
+_experiments/
+_models/
+attic/
